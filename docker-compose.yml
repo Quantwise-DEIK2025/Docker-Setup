@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    pull_policy: if_not_present
+    command: ["serve"]
+    tty: true
+    restart: always
+    volumes:
+      - ./Models:/root/.ollama/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  chunking:
+    container_name: chunking
+    build: .
+    volumes:
+      - ./know_how:/app/know_how
+      - ./Models:/app/Models
+      - ./db:/app/db
+    depends_on:
+      - ollama
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: ["sleep", "infinity"]
