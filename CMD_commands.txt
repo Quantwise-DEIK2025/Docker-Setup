@@ -1,0 +1,5 @@
+1.   docker compose up -d ollama
+
+2.   docker compose up -d chunking
+
+3.   docker compose exec chunking python3 chunking.py --input know_how/
