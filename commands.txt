@@ -1,0 +1,5 @@
+docker compose up -d --build
+
+docker exec rag_project-ollama-1 ollama create chunker_full_doc -f /tmp/Modelfile
+
+docker exec chunking python chunking.py --input /app/know_how --table my_table --recreate_table
