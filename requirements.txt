@@ -114,3 +114,5 @@ urllib3==2.5.0
 xlsxwriter==3.2.5
 rerankers
 einops
+fastapi
+uvicorn[standard]
