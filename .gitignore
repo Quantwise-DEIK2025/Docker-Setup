@@ -1,0 +1,5 @@
+db/**
+open-webui-data/**
+Models/blobs/**
+Models/manifests/**
+venv/**

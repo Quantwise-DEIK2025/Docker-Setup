@@ -12,9 +12,13 @@ import os
 import hashlib
 import argparse
 from tqdm import tqdm
+import re, unicodedata
+import subprocess
+
 
 EMBEDDING_MODEL_NAME = "nomic-ai/nomic-embed-text-v1.5"
 MAX_TOKENS = 2000
+OLLAMA_MODEL_NAME = "chunker_full_doc"
 
 # Define model
 class DbHandler:
@@ -82,6 +86,22 @@ class DbHandler:
                         .to_pandas()
         return results
     
+    def check_existing_documents(self, table_name):
+        """
+        Checks which documents have already been processed and are present in the specified table.
+        Args:
+            table_name (str): The name of the table to check.
+
+        Returns:
+            set: A set of unique document names already present in the table.
+        """
+        table = self.db.open_table(table_name)
+        results = table.search() \
+                        .to_pandas()
+        
+        unique_documents = set(results['document'])
+        return unique_documents
+    
     def create_model_class(embedding_model):
         """
         Factory function used for generating a schema when creating new tables.
@@ -121,10 +141,34 @@ class SemanticChunker:
             merge_peers=True  # Optional, defaults to true
         )
 
+    def clean_docling_chunk_strings(self, chunks):
+        cleaned_chunks = []
+        
+        for chunk in chunks:
+            # 1️⃣ Normalize Unicode and replace problematic punctuation
+            chunk = unicodedata.normalize("NFKD", chunk).replace("\u00A0", " ")
+            chunk = chunk.translate(str.maketrans({
+                "–": "-", "—": "-", "‘": "'", "’": "'", "“": '"', "”": '"'
+            }))
+
+            # 2️⃣ Remove URLs (massive tokenizers killers)
+            chunk = re.sub(r"http\S+", "", chunk)
+
+            # 3️⃣ Normalize whitespace but preserve paragraphs
+            chunk = re.sub(r"[ \t]+", " ", chunk)
+            chunk = re.sub(r"\n\s*\n", "\n\n", chunk)  # merge single newlines, keep double
+            chunk = chunk.strip()
+
+            cleaned_chunks.append(chunk)
+
+        return cleaned_chunks
+
     def process_document(self, document_path, table_name, recreate_table=False):
         """
         Processes a document by converting, chunking, generating context, and storing results.
+        
         This method performs the following steps:
+
             1. Converts the input document to a Docling Document using the configured converter.
             2. Chunks the document using the configured chunker.
             3. For each chunk, generates additional context using an Ollama model, providing both the full document and the chunk as input.
@@ -137,26 +181,58 @@ class SemanticChunker:
         Returns:
             None
         """
+        ###### ----- 1️⃣ Preliminary chunking and text transformations ---- ######
         # Convert the document to a Docling Document
         doc = self.converter.convert(document_path).document
 
         # Chunking the document
         chunks = list(self.chunker.chunk(dl_doc=doc))
+        chunks_str = [chunk.text for chunk in chunks]
+        chunks_str = self.clean_docling_chunk_strings(chunks_str)
+
+        # Free up CUDA memory right after we got the results from Docling, so that Ollama can use the entire GPU
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Prepare chunks with metadata
         chunks_with_metadata = []
-        entire_doc = "FULL DOCUMENT:\n" + " ".join([chunk.text for chunk in chunks])
+
 
         for chunk in tqdm(chunks, desc=f"Processing {document_path.split('/')[-1]}", position=1, leave=False):
-            ollama_prompt = f"CHUNK:\n{chunk.text}"
-            history = [{'role': 'user', 'content': entire_doc}, {'role': 'user', 'content': ollama_prompt}] # We want the history to only contain the full document and the current chunk to get context for the chunk
+            entire_doc = ""
+
+            ###### ----- 2️⃣ Determine sliding window interval ---- ######
+            chunk_index = chunks.index(chunk)
+
+            context_length = 16_000 # Reduce window to save memory
+            context_length = context_length - 2 * MAX_TOKENS # We need to reserve space for the chunk itself (twice, the context contains the chunk itself)
+            total_context_chunk_number = context_length // (MAX_TOKENS*2) # 2x, cuz before and after the chunk
+
+            start_index_original = chunk_index - total_context_chunk_number
+            start_index_truncated = max(0, start_index_original) # Avoid index out of bounds
+
+            end_index_original = chunk_index + total_context_chunk_number
+            end_index_truncated = min(len(chunks)-1, end_index_original)
+
+            if start_index_original < 0: # We are at the start of the document, so we need to add more chunks at the end
+                end_index_truncated = min(len(chunks)-1, end_index_truncated + abs(start_index_original))
+            if end_index_original > len(chunks)-1: # We are at the end of the document, so we need to add more chunks at the start
+                start_index_truncated = max(0, start_index_truncated - abs(end_index_original - end_index_truncated))
+
+            for i in range(start_index_truncated, end_index_truncated + 1):
+                entire_doc += " " + chunks_str[i]
+
+            ###### ----- 3️⃣ Generating context with Ollama ---- ######
+            entire_doc = "FULL DOCUMENT:\n" + entire_doc
+            ollama_prompt = f"CHUNK:\n{chunks_str[chunk_index]}"
+            history = [{'role': 'user', 'content': entire_doc}, {'role': 'user', 'content': ollama_prompt}] # We want the history to only contain the current chunk and surrounding text to get context for the chunk
 
             response = ollama.chat(
-                model="chunker_full_doc",
+                model=OLLAMA_MODEL_NAME,
                 messages=history
             )
             context = response['message']['content']
-            text_to_embed = chunk.text + "\n\n" + context # We put the context AFTER the chunk to not mess up cosine similarity but still
+            text_to_embed = chunks_str[chunk_index] + "\n\n" + context # We put the context AFTER the chunk to not mess up cosine similarity but still benefit keyword search for exact matches
 
             # Extracting page numbers from metadata
             pages = set( 
@@ -165,16 +241,24 @@ class SemanticChunker:
                 for prov in doc_item.prov
             )
             # Unique ID to avoid duplicates later on
-            id = hashlib.sha256(chunk.text.encode()).hexdigest()
+            id = hashlib.sha256(chunks_str[chunk_index].encode()).hexdigest()
 
-            chunks_with_metadata.append({'text': text_to_embed, 'original_text':chunk.text, 'context':context, 'document':document_path.split("/")[-1], 'pages':list(pages), 'id': id})
+            chunks_with_metadata.append({'text': text_to_embed, 'original_text':chunks_str[chunk_index], 'context':context, 'document':document_path.split("/")[-1], 'pages':list(pages), 'id': id})
 
+        ###### ----- 4️⃣ Uploading to LanceDB + clean up GPU memory ---- ######
+        # Free up ollama from GPU memory so that Docling can semantically analyze the next doc even if it's like 100 pages
+        subprocess.run(["ollama", "stop", OLLAMA_MODEL_NAME], check=True)
         self.db_handler.add_to_table(table_name=table_name, chunks_with_metadata=chunks_with_metadata)
+        # Free up CUDA memory again, because the LanceDB embedding model is still in memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     def process_directory(self, directory_path, table_name, recreate_table=False):
         """
         Convenience method, does the same thing as `process_document()`, except for every PDF in a directory.
+
         This method performs the following steps:
+            0. Checks all PDF files in the directory to see if they have already been processed, and skips them if so.
             1. Converts the input document to a Docling Document using the configured converter.
             2. Chunks the document using the configured chunker.
             3. For each chunk, generates additional context using an Ollama model, providing both the full document and the chunk as input.
@@ -187,7 +271,10 @@ class SemanticChunker:
         Returns:
             None
         """
-        pdf_names = [f for f in os.listdir(directory_path) if f.endswith('.pdf')]
+        pdf_names = set([f for f in os.listdir(directory_path) if f.endswith('.pdf')])
+        existing_documents = self.db_handler.check_existing_documents(table_name=table_name)
+        print(f"The following documents already exist in the database and will be skipped: {pdf_names & existing_documents}")
+        pdf_names = pdf_names - existing_documents  # Process only new documents
         
         for study_name in tqdm(pdf_names, desc="All PDFs", position=0):
             self.process_document(document_path=f"{directory_path}/{study_name}", table_name=table_name, recreate_table=recreate_table)
