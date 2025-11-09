@@ -1,0 +1,103 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    pull_policy: if_not_present
+    tty: true
+    restart: always
+    volumes:
+      - ./Models:/root/.ollama/models
+      - ollama-data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  chunking:
+    container_name: chunking
+    build: .
+    volumes:
+      - ./know_how:/app/know_how
+      - ./Models:/app/Models
+      - ./db:/app/db
+      - ollama-data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - TABLE_NAME=my_table
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: on-failure
+    depends_on:
+      ollama:
+        condition: service_started
+    command: >
+      sh -c "
+        set -e
+        echo '[CHUNK_SERVICE] Indítás...'
+        echo '[CHUNK_SERVICE] Várakozás az Ollama API-ra (http://ollama:11434)...'
+        
+        # Vár, amíg az Ollama API ténylegesen válaszol
+        while ! curl -s http://ollama:11434/api/tags > /dev/null; do
+          echo '[CHUNK_SERVICE] Ollama még nem elérhető, várakozás 5 másodpercet...'
+          sleep 5
+        done
+        
+        echo '[CHUNK_SERVICE] Ollama elérhető. A chunker_full_doc modell létrehozása...'
+        ollama create chunker_full_doc -f /app/Models/chunker_full_doc.Modelfile
+        echo '[CHUNK_SERVICE] Modell létrehozva vagy már létezett.'
+        
+        echo '[CHUNK_SERVICE] A chunking.py script indítása...'
+        # JAVÍTVA: Most már a $$TABLE_NAME környezeti változót használja
+        python3 chunking.py --input /app/know_how --table $$TABLE_NAME
+        
+        echo '[CHUNK_SERVICE] Feldolgozás kész. A szolgáltatás leáll.'
+      "
+
+  rag_api:
+    container_name: rag_api
+    build: .
+    volumes:
+      - ./db:/app/db
+      - .:/app
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - TABLE_NAME=my_table
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: always
+    command: ["uvicorn", "rag_api:app", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      ollama:
+        condition: service_started
+      chunking:
+        condition: service_completed_successfully
+
+  open-webui:
+    container_name: open-webui
+    image: ghcr.io/open-webui/open-webui:main
+    ports:
+      - "3000:8080"
+    volumes:
+      - ./open-webui-data:/app/backend/data
+    restart: always
+    environment:
+      - OLLAMA_BASE_URL=http://rag_api:8000
+    depends_on:
+      rag_api:
+        condition: service_started
+
+volumes:
+  ollama-data:
