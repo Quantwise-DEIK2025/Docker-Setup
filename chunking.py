@@ -277,7 +277,10 @@ class SemanticChunker:
         pdf_names = pdf_names - existing_documents  # Process only new documents
         
         for study_name in tqdm(pdf_names, desc="All PDFs", position=0):
-            self.process_document(document_path=f"{directory_path}/{study_name}", table_name=table_name, recreate_table=recreate_table)
+            try:
+                self.process_document(document_path=f"{directory_path}/{study_name}", table_name=table_name, recreate_table=recreate_table)
+            except Exception as e:
+                print(f"ERROR! Something unexpected happened when processing document {study_name}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Semantic Chunker Entrypoint")
