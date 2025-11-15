@@ -271,16 +271,16 @@ class SemanticChunker:
         Returns:
             None
         """
-        pdf_names = set([f for f in os.listdir(directory_path) if f.endswith('.pdf')])
+        pdf_names = set([f for f in os.listdir(directory_path)])
         existing_documents = self.db_handler.check_existing_documents(table_name=table_name)
         print(f"The following documents already exist in the database and will be skipped: {pdf_names & existing_documents}")
         pdf_names = pdf_names - existing_documents  # Process only new documents
         
-        for study_name in tqdm(pdf_names, desc="All PDFs", position=0):
+        for study_name in tqdm(pdf_names, desc="All documents", position=0):
             try:
                 self.process_document(document_path=f"{directory_path}/{study_name}", table_name=table_name, recreate_table=recreate_table)
             except Exception as e:
-                print(f"ERROR! Something unexpected happened when processing document {study_name}")
+                print(f"ERROR! Something unexpected happened when processing document {study_name}\nStack trace: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Semantic Chunker Entrypoint")
