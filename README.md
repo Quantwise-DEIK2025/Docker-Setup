@@ -58,3 +58,8 @@ Once chunking is complete, OpenWebUI will be ready for interaction.
 ## Notice
 
 Please note that the first time you run `docker compose up`, it will take a really long time depending on your internet connection and hardware. The project needs to download approximately 30 GB of data on the first run, but is able to work entirely offline after that.
+
+
+## Experiment it out
+
+[![See the video demonstration of the project](https://img.youtube.com/vi/FySHycCICoM/maxresdefault.jpg)](https://youtu.be/FySHycCICoM)
